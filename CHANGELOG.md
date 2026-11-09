@@ -5,6 +5,22 @@ All notable changes to this module are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this module adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-11-09
+
+### Changed
+
+- Clarify insertion order, repeatable Err results, shared error objects and
+  synchronization requirements in GoDoc and README.
+- Document typed nil errors, eager Require argument evaluation and sensitive
+  diagnostics. Preserve Require as a public naming exception; behavior and
+  signatures are unchanged.
+- Rename the internal boolean parameter to isValid.
+
+### Added
+
+- Tests for wrapped causes, earlier result stability, Add(nil) and typed nil
+  errors, plus a complete README quick start.
+
 ## [0.1.0] - 2026-09-01
 
 Previously distributed as `github.com/uchaloop/confmaker/validate`. Update the
