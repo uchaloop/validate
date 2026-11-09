@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -9,9 +10,17 @@ on:
 permissions:
   contents: read
 
+env:
+  GOWORK: "off"
+
+concurrency:
+  group: validate-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref_type == 'branch' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -19,6 +28,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: false
 
       - name: Check formatting
         run: |
@@ -28,6 +38,12 @@ jobs:
             echo "$unformatted"
             exit 1
           fi
+
+      - name: Check module files
+        run: go mod tidy -diff
+
+      - name: Build
+        run: go build ./...
 
       - name: Vet
         run: go vet ./...

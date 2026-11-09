@@ -8,62 +8,99 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: validate-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  pkg-go-dev:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger pkg.go.dev to index the release
-        env:
-          MODULE: github.com/uchaloop/validate
-        run: |
-          version="${GITHUB_REF_NAME}"
-          curl -fsS "https://proxy.golang.org/${MODULE}/@v/${version}.info"
+  checks:
+    uses: ./.github/workflows/ci.yml
 
   release:
+    needs: checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          # The whole history, so the previous tag can be found for the
-          # comparison link.
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Take the release notes from the changelog
+      - name: Validate version and extract release notes
+        shell: python
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          import datetime
+          import os
+          import pathlib
+          import re
+          import subprocess
 
-          awk -v v="$version" '
-            $0 ~ "^## \\[" v "\\]" { found = 1; next }
-            found && /^## / { exit }
-            found
-          ' CHANGELOG.md > notes.md
+          tag = os.environ["GITHUB_REF_NAME"]
+          number = r"(?:0|[1-9][0-9]*)"
+          identifier = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+          pattern = rf"v({number})\.({number})\.({number})(?:-({identifier}(?:\.{identifier})*))?"
+          match = re.fullmatch(pattern, tag)
+          if match is None:
+              raise SystemExit("Expected a Go release tag vMAJOR.MINOR.PATCH[-PRERELEASE]")
+          module = re.search(r"^module\s+(\S+)\s*$", pathlib.Path("go.mod").read_text(), re.M)
+          if module is None or module[1] != "github.com/uchaloop/validate" or int(match[1]) > 1:
+              raise SystemExit("Tag major is incompatible with this module path")
 
-          # A tag whose version is still filed under Unreleased would publish an
-          # empty release. Say so instead.
-          if ! grep -q '[^[:space:]]' notes.md; then
-            echo "CHANGELOG.md has no section for ${version}" >&2
-            exit 1
-          fi
+          version = tag[1:]
+          sections = re.split(r"^## ", pathlib.Path("CHANGELOG.md").read_text(), flags=re.M)[1:]
+          candidates = [section for section in sections if section.splitlines()[0].startswith(f"[{version}]")]
+          if len(candidates) != 1:
+              raise SystemExit("Expected exactly one changelog section for " + version)
+          header, _, body = candidates[0].partition("\n")
+          date = re.fullmatch(re.escape(f"[{version}] - ") + r"(\d{4}-\d{2}-\d{2})", header)
+          if date is None:
+              raise SystemExit("Changelog section must have a release date, not Unreleased")
+          datetime.date.fromisoformat(date[1])
+          if not body.strip():
+              raise SystemExit("Release notes must not be empty")
 
-          previous="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
-          if [ -n "$previous" ]; then
-            printf '\n**Full Changelog**: %s/compare/%s...%s\n' \
-              "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
-              "$previous" "${GITHUB_REF_NAME}" >> notes.md
-          fi
+          # Restrict comparisons to reachable stable tags belonging to this module.
+          parents = subprocess.run(["git", "rev-parse", "--verify", "HEAD^"], capture_output=True, text=True)
+          if parents.returncode == 0:
+              tags = subprocess.check_output(["git", "tag", "--merged", "HEAD^", "--sort=-version:refname"], text=True)
+              previous = next((value for value in tags.splitlines() if re.fullmatch(rf"v[01]\.{number}\.{number}", value)), None)
+              if previous:
+                  repository = os.environ["GITHUB_SERVER_URL"] + "/" + os.environ["GITHUB_REPOSITORY"]
+                  body += f"\n**Full Changelog**: {repository}/compare/{previous}...{tag}\n"
+          pathlib.Path("notes.md").write_text(body.strip() + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("prerelease=" + str(match[1] == "0" or match[4] is not None).lower() + "\n")
+        id: notes
 
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ steps.notes.outputs.prerelease }}
         run: |
-          args=(--title "${GITHUB_REF_NAME}" --notes-file notes.md --verify-tag)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release already exists; leaving it unchanged."
+            exit 0
+          fi
+          args=(--title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag)
+          if [ "$PRERELEASE" = true ]; then
+            args+=(--prerelease --latest=false)
+          fi
+          # Stable releases retain GitHub's automatic latest selection.
+          gh release create "$GITHUB_REF_NAME" "${args[@]}"
 
-          # Everything before 1.0 is published as a pre-release: the API is still
-          # allowed to break between minors.
-          case "${GITHUB_REF_NAME}" in
-            v0.*) args+=(--prerelease) ;;
-          esac
-
-          gh release create "${GITHUB_REF_NAME}" "${args[@]}"
+  go-proxy:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check release availability in Go proxy
+        env:
+          MODULE: github.com/uchaloop/validate
+        run: |
+          # This confirms proxy availability, not pkg.go.dev indexing.
+          # If it fails after publication, rerun only the failed job.
+          curl --fail --show-error --silent --connect-timeout 10 --max-time 30 \
+            --retry 3 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            "https://proxy.golang.org/${MODULE}/@v/${GITHUB_REF_NAME}.info"

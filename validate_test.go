@@ -2,6 +2,8 @@ package validate
 
 import (
 	"errors"
+	"io"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -47,5 +49,76 @@ func TestErrorsIsCompatible(t *testing.T) {
 
 	if !errors.Is(e.Err(), sentinel) {
 		t.Fatal("errors.Is should find the recorded sentinel")
+	}
+}
+
+func TestErrorsPreserveCauses(t *testing.T) {
+	cause := &strconv.NumError{
+		Func: "ParseInt",
+		Num:  "invalid",
+		Err:  strconv.ErrSyntax,
+	}
+
+	var errs Errors
+	errs.Addf("port: %w", cause)
+	errs.Require(false, "nested: %w", io.EOF)
+
+	result := errs.Err()
+	var got *strconv.NumError
+	if !errors.As(result, &got) || got != cause {
+		t.Fatal("typed cause was lost")
+	}
+
+	if !errors.Is(result, strconv.ErrSyntax) || !errors.Is(result, io.EOF) {
+		t.Fatal("wrapped causes were lost")
+	}
+}
+
+func TestErrorsSnapshots(t *testing.T) {
+	var errs Errors
+	errs.Addf("first")
+	errs.Addf("second")
+
+	first := errs.Err()
+	if first.Error() != "first\nsecond" || errs.Err().Error() != first.Error() {
+		t.Fatal("order changed or Err consumed errors")
+	}
+
+	errs.Addf("third")
+	if first.Error() != "first\nsecond" {
+		t.Fatal("previous result changed after Add")
+	}
+
+	if errs.Err().Error() != "first\nsecond\nthird" {
+		t.Fatal("new error missing")
+	}
+}
+
+func TestAddNilLeavesEmpty(t *testing.T) {
+	var errs Errors
+	errs.Add(nil)
+	if err := errs.Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil", err)
+	}
+}
+
+type nilReceiverError struct{}
+
+func (*nilReceiverError) Error() string { return "typed nil error" }
+
+func TestAddPreservesTypedNil(t *testing.T) {
+	var cause *nilReceiverError
+	var errs Errors
+	errs.Add(cause)
+	result := errs.Err()
+	if result == nil {
+		t.Fatal("typed nil error was discarded")
+	}
+	var got *nilReceiverError
+	if !errors.As(result, &got) || got != nil {
+		t.Fatal("typed nil cause was not preserved")
+	}
+	if result.Error() != "typed nil error" {
+		t.Fatalf("unexpected message: %q", result.Error())
 	}
 }
